@@ -12,6 +12,7 @@ from itertools import cycle
 from collections import defaultdict
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.interpolate import griddata
+
 # 设置绘图样式
 plt.style.use('seaborn-v0_8')
 plt.rcParams['font.sans-serif'] = ['SimHei']  # 支持中文
@@ -130,23 +131,31 @@ class NASVisualizer:
         self.update_plot()
 
     def calculate_pareto_front(self, points):
-        """计算3D帕累托前沿"""
+        """计算3D帕累托前沿，调整优化方向"""
         points = np.array(points)
         if len(points) < 3:
             return points
 
         # 移除无效点
         valid_points = points[~np.isnan(points).any(axis=1)]
-        print("有效数据：", valid_points)
         if len(valid_points) < 3:
             return valid_points
 
+        # 调整优化方向
+        # - Dice 系数：越大越好（保持不变）
+        # - 参数量：越小越好（取反）
+        # - 鲁棒性：越小越好（取反）
+        adjusted_points = valid_points.copy()
+        adjusted_points[:, 1] = -adjusted_points[:, 1]  # 参数量取反
+        adjusted_points[:, 2] = -adjusted_points[:, 2]  # 鲁棒性取反
+        # Dice 系数（[:, 0]）保持不变
+
         # 标准化处理
-        mins = valid_points.min(axis=0)
-        maxs = valid_points.max(axis=0)
+        mins = adjusted_points.min(axis=0)
+        maxs = adjusted_points.max(axis=0)
         ranges = maxs - mins
         ranges[ranges == 0] = 1  # 避免除以零
-        normalized = (valid_points - mins) / ranges
+        normalized = (adjusted_points - mins) / ranges
 
         print("标准化后的数据：", normalized)
 
@@ -166,7 +175,7 @@ class NASVisualizer:
             return valid_points
 
     def update_plot(self):
-        """更新3D绘图"""
+        """更新3D绘图，修正墙角平面投影方向为最差方向"""
         self.ax.clear()
 
         # 获取当前代数据
@@ -179,70 +188,78 @@ class NASVisualizer:
             plt.draw()
             return
 
-        val_dice = gen_data[:, 0]
-        params = gen_data[:, 1]
-        robustness = gen_data[:, 2]
-
         # 计算帕累托前沿
         pareto_points = self.calculate_pareto_front(gen_data)
 
-        # 绘制普通点
+        # 检查是否有有效的帕累托前沿点
+        if len(pareto_points) == 0:
+            self.ax.text(0.5, 0.5, 0.5, "无帕累托前沿点", ha='center')
+            plt.draw()
+            return
+
+        # 绘制帕累托前沿点
         self.ax.scatter(
-            params, val_dice, robustness,
-            c=[self.gen_colors[self.current_gen]] * len(val_dice),
-            s=60, alpha=0.6, label='普通架构'
+            pareto_points[:, 1], pareto_points[:, 0], pareto_points[:, 2],
+            c='gold', s=120, edgecolors='black',
+            marker='*', label='最优架构'
         )
 
-        # 检查有效的帕累托前沿点
-        if len(pareto_points) > 1:
-            # 按参数排序以便连线
-            order = np.lexsort((pareto_points[:, 2], pareto_points[:, 1]))
+        # 减少平面数量：只为部分点绘制平面（例如每隔一个点）
+        step = max(1, len(pareto_points)//len(pareto_points))  # 控制绘制平面的点数量，最多绘制5个点
+        selected_points = pareto_points[::step]
 
-            # 生成网格数据
-            grid_x, grid_y = np.meshgrid(np.linspace(pareto_points[:, 1].min(), pareto_points[:, 1].max(), 50),
-                                         np.linspace(pareto_points[:, 0].min(), pareto_points[:, 0].max(), 50))
+        # 绘制每个选定帕累托点的“墙角”平面
+        for point in selected_points:
+            x, y, z = point[1], point[0], point[2]  # params, val_dice, robustness
 
-            # 使用griddata进行插值
-            grid_z = griddata((pareto_points[:, 1], pareto_points[:, 0]), pareto_points[:, 2], (grid_x, grid_y),
-                              method='linear')
+            # 定义平面的边界（向“最差”方向延伸）
+            # - 参数量：越小越好，最差值是最大值 x=2.0
+            # - Dice 系数：越大越好，最差值是最小值 y=0.8
+            # - 鲁棒性：越小越好，最差值是最大值 z=0.3
+            x_worst, y_worst, z_worst = 2.0, 0.8, 0.3  # 坐标轴的“最差”值
 
-            # 检查是否有NaN值
-            if np.isnan(grid_z).any():
-                print("插值结果中包含NaN值，可能需要调整插值参数或数据范围")
-                # 将NaN值替换为0
-                grid_z = np.nan_to_num(grid_z)
+            # 降低网格密度以提高性能
+            grid_size = 10
 
-            # 绘制曲面
-            surface = self.ax.plot_surface(grid_x, grid_y, grid_z, color='gray', alpha=0.5, rstride=100, cstride=100)
+            # 平面 1：平行于 yz 平面 (x = x_i)，从 x_i 向 x_worst 延伸
+            y_range = np.linspace(y, y_worst, grid_size)  # Dice 从 y_i 向 0.8 延伸
+            z_range = np.linspace(z, z_worst, grid_size)  # 鲁棒性从 z_i 向 0.3 延伸
+            Y, Z = np.meshgrid(y_range, z_range)
+            X = np.full_like(Y, x)
+            self.ax.plot_surface(X, Y, Z, color='#FF9999', alpha=0.05, rstride=1, cstride=1)
 
-            # 突出前沿点
-            self.ax.scatter(
-                pareto_points[:, 1], pareto_points[:, 0], pareto_points[:, 2],
-                c='gold', s=120, edgecolors='black',
-                marker='*', label='最优架构'
-            )
+            # 平面 2：平行于 xz 平面 (y = y_i)，从 y_i 向 y_worst 延伸
+            x_range = np.linspace(x, x_worst, grid_size)  # 参数量从 x_i 向 2.0 延伸
+            z_range = np.linspace(z, z_worst, grid_size)  # 鲁棒性从 z_i 向 0.3 延伸
+            X, Z = np.meshgrid(x_range, z_range)
+            Y = np.full_like(X, y)
+            self.ax.plot_surface(X, Y, Z, color='#99FF99', alpha=0.05, rstride=1, cstride=1)
+
+            # 平面 3：平行于 xy 平面 (z = z_i)，从 z_i 向 z_worst 延伸
+            x_range = np.linspace(x, x_worst, grid_size)  # 参数量从 x_i 向 2.0 延伸
+            y_range = np.linspace(y, y_worst, grid_size)  # Dice 从 y_i 向 0.8 延伸
+            X, Y = np.meshgrid(x_range, y_range)
+            Z = np.full_like(X, z)
+            self.ax.plot_surface(X, Y, Z, color='#9999FF', alpha=0.05, rstride=1, cstride=1)
 
         # 设置坐标轴范围
         self.ax.set_xlim([0, 2])  # 参数量 (MB) ↓
         self.ax.set_ylim([0.8, 1])  # Dice系数 ↑
-        self.ax.set_zlim([0, 0.3])  # 鲁棒性 ↑
+        self.ax.set_zlim([0, 0.3])  # 鲁棒性 ↓
 
-        # 设置坐标轴
+        # 设置坐标轴标签，确保方向正确
         self.ax.set_xlabel('参数量 (MB) ↓', fontsize=12)
         self.ax.set_ylabel('Dice系数 ↑', fontsize=12)
-        self.ax.set_zlabel('鲁棒性 ↑', fontsize=12)
+        self.ax.set_zlabel('鲁棒性 ↓', fontsize=12)
         self.ax.set_title(
-            f'第 {self.current_gen + 1} 代架构评估 (共{len(self.generations)}代)',
+            f'第 {self.current_gen + 1} 代帕累托前沿 (共{len(self.generations)}代)',
             fontsize=14, pad=20
         )
 
         # 添加统计信息
         stats_text = (
-            f'平均值:\n'
-            f'Dice: {val_dice.mean():.3f}\n'
-            f'参数: {params.mean():.3f} MB\n'
-            f'鲁棒: {robustness.mean():.3f}\n'
-            f'有效点: {len(gen_data)}/30'
+            f'帕累托前沿点数: {len(pareto_points)}\n'
+            f'绘制平面点数: {len(selected_points)}\n'
         )
         self.ax.text2D(
             0.02, 0.98, stats_text,
@@ -259,7 +276,7 @@ class NASVisualizer:
 
 def main():
     # 配置参数
-    base_dir = "C:/Users/11659/Desktop/search-GA-BiObj-micro-20250330-205519"  # 替换为实际路径
+    base_dir = "D:/PycharmProjects/Muti-Obj-Visu/search-GA-BiObj-micro-20250330-205519"  # 替换为实际路径
 
     # 解析日志
     print("正在解析日志文件...")
